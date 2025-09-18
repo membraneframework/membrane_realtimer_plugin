@@ -5,8 +5,13 @@ defmodule Membrane.Realtimer do
   If buffers come in slower than realtime, they're sent as they come in.
 
   It can be reset by sending `%#{inspect(__MODULE__)}.Events.Reset{}` event on its input pad.
+
+  It can also handle flushing mode - when it receives `:enter_flushing_mode` notification from its parent,
+  it immediately forwards everything as it comes in, without looking at timestamps.
   """
   use Membrane.Filter
+
+  require Membrane.Logger
 
   alias __MODULE__.Events
   alias Membrane.Buffer
@@ -16,7 +21,13 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_init(_ctx, _opts) do
-    {[], %{previous_timestamp: nil, tick_actions: [], timer_status: :to_be_started}}
+    {[],
+     %{
+       previous_timestamp: nil,
+       tick_actions: [],
+       timer_status: :to_be_started,
+       flushing_mode?: false
+     }}
   end
 
   @impl true
@@ -25,7 +36,20 @@ defmodule Membrane.Realtimer do
   end
 
   @impl true
-  def handle_buffer(:input, buffer, _ctx, state) do
+  def handle_parent_notification(:enter_flushing_mode, ctx, state) do
+    Membrane.Logger.debug("Entering flushing mode")
+
+    {flushed_actions, state} = flush_tick_actions(ctx, state)
+
+    maybe_stop_timer =
+      if state.timer_status == :running, do: [stop_timer: :timer], else: []
+
+    state = %{state | flushing_mode?: true, timer_status: :to_be_started}
+    {flushed_actions ++ maybe_stop_timer, state}
+  end
+
+  @impl true
+  def handle_buffer(:input, buffer, _ctx, state) when not state.flushing_mode? do
     {maybe_start_timer, state} =
       if state.timer_status == :to_be_started,
         do: {[start_timer: {:timer, :no_interval}], %{state | timer_status: :running}},
@@ -45,6 +69,11 @@ defmodule Membrane.Realtimer do
     }
 
     {maybe_start_timer ++ [timer_interval: {:timer, interval}], state}
+  end
+
+  @impl true
+  def handle_buffer(:input, buffer, _ctx, state) when state.flushing_mode? do
+    {[buffer: {:output, buffer}, demand: {:input, 1}], state}
   end
 
   @impl true
@@ -97,10 +126,7 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_tick(:timer, ctx, state) do
-    actions =
-      [timer_interval: {:timer, :no_interval}] ++
-        Enum.reverse(state.tick_actions) ++
-        if ctx.pads.input.end_of_stream?, do: [], else: [demand: {:input, 1}]
+    {actions, state} = flush_tick_actions(ctx, state)
 
     {maybe_stop_timer, state} =
       case state.timer_status do
@@ -109,5 +135,13 @@ defmodule Membrane.Realtimer do
       end
 
     {actions ++ maybe_stop_timer, %{state | tick_actions: []}}
+  end
+
+  defp flush_tick_actions(ctx, state) do
+    actions =
+      Enum.reverse(state.tick_actions) ++
+        if ctx.pads.input.end_of_stream?, do: [], else: [demand: {:input, 1}]
+
+    {actions, %{state | tick_actions: []}}
   end
 end

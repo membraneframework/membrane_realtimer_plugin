@@ -1,13 +1,12 @@
 defmodule Membrane.RealtimerTest do
   use ExUnit.Case
 
+  import Membrane.ChildrenSpec
   import Membrane.Testing.Assertions
 
   alias Membrane.{Buffer, Realtimer, Testing, Time}
 
   test "Limits playback speed to realtime" do
-    import Membrane.ChildrenSpec
-
     buffers = [
       %Buffer{pts: 0, payload: 0},
       %Buffer{pts: Time.milliseconds(100), payload: 1}
@@ -36,15 +35,38 @@ defmodule Membrane.RealtimerTest do
       %Buffer{pts: Time.seconds(10), payload: 0}
     ]
 
-    spec = [
+    spec =
       child(:src, %Testing.Source{output: Testing.Source.output_from_buffers(buffers)})
       |> child(:realtimer, Realtimer)
       |> child(:sink, Testing.Sink)
-    ]
 
     pipeline = Testing.Pipeline.start_link_supervised!(spec: spec)
     assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0}, 200)
     assert_end_of_stream(pipeline, :sink)
+    Testing.Pipeline.terminate(pipeline)
+  end
+
+  test "Flushing mode" do
+    buffers =
+      1..10
+      |> Enum.map(fn i -> %Buffer{pts: Time.seconds(i), payload: i} end)
+
+    spec =
+      child(:src, %Testing.Source{output: Testing.Source.output_from_buffers(buffers)})
+      |> child(:realtimer, Realtimer)
+      |> child(:sink, Testing.Sink)
+
+    pipeline = Testing.Pipeline.start_link_supervised!(spec: spec)
+    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 200)
+
+    Testing.Pipeline.notify_child(pipeline, :realtimer, :enter_flushing_mode)
+
+    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 10}, 200)
+
+    for i <- 2..9 do
+      assert_sink_buffer(pipeline, :sink, %Buffer{payload: ^i}, 0)
+    end
+
     Testing.Pipeline.terminate(pipeline)
   end
 end
