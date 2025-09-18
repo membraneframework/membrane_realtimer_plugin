@@ -42,7 +42,9 @@ defmodule Membrane.Realtimer do
     {flushed_actions, state} = flush_tick_actions(ctx, state)
 
     maybe_stop_timer =
-      if state.timer_status == :running, do: [stop_timer: :timer], else: []
+      if state.timer_status in [:running, :to_be_stopped],
+        do: [stop_timer: :timer],
+        else: []
 
     state = %{state | flushing_mode?: true, timer_status: :to_be_started}
     {flushed_actions ++ maybe_stop_timer, state}
