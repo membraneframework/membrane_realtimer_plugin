@@ -26,20 +26,21 @@ defmodule Membrane.Realtimer do
     @moduledoc false
 
     @type t :: %__MODULE__{
-            reference_time: Membrane.Time.non_neg() | nil,
-            reference_timestamp: Membrane.Time.non_neg() | nil,
-            tick_actions: [Membrane.Element.Action.t()],
-            timer_status: :to_be_started | :running | :to_be_stopped
+            reference_timestamps:
+              %{
+                system: Membrane.Time.non_neg(),
+                stream: Membrane.Time.non_neg()
+              }
+              | :not_set,
+            tick_actions: [Membrane.Element.Action.t()]
           }
 
     @enforce_keys [:latency]
 
     defstruct @enforce_keys ++
                 [
-                  reference_time: nil,
-                  reference_timestamp: nil,
-                  tick_actions: [],
-                  timer_status: :to_be_started
+                  reference_timestamps: :not_set,
+                  tick_actions: []
                 ]
   end
 
@@ -55,47 +56,49 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_buffer(:input, buffer, _ctx, state = %State{}) do
-    {maybe_start_timer, state} =
-      if state.timer_status == :to_be_started do
-        {
-          [start_timer: {:timer, :no_interval}],
-          %State{
-            state
-            | timer_status: :running,
-              reference_time: Membrane.Time.monotonic_time(),
-              reference_timestamp: Buffer.get_dts_or_pts(buffer)
-          }
+    state =
+      if state.reference_timestamps == :not_set do
+        %State{
+          state
+          | reference_timestamps: %{
+              system: Membrane.Time.monotonic_time(),
+              stream: Buffer.get_dts_or_pts(buffer)
+            }
         }
       else
-        {[], state}
+        state
       end
 
-    time_from_reference_time = Buffer.get_dts_or_pts(buffer) - state.reference_timestamp
+    delta_timestamp = Buffer.get_dts_or_pts(buffer) - state.reference_timestamps.stream
+    target_time = state.reference_timestamps.system + delta_timestamp + state.latency
 
-    target_time = state.reference_time + time_from_reference_time + state.latency
+    interval =
+      (target_time - Membrane.Time.monotonic_time())
+      |> max(0)
+      |> Membrane.Time.as_milliseconds(:round)
 
-    interval = max(target_time - Membrane.Time.monotonic_time(), 0)
+    Process.send_after(self(), :tick, interval)
 
     state = %State{
       state
-      | tick_actions: [buffer: {:output, buffer}] ++ state.tick_actions
+      | tick_actions: [{:buffer, {:output, buffer}} | state.tick_actions]
     }
 
-    {maybe_start_timer ++ [timer_interval: {:timer, interval}], state}
+    {[], state}
+  end
+
+  @impl true
+  def handle_info(:tick, ctx, %State{} = state) do
+    actions =
+      Enum.reverse(state.tick_actions) ++
+        if ctx.pads.input.end_of_stream?, do: [], else: [demand: :input]
+
+    {actions, %State{state | tick_actions: []}}
   end
 
   @impl true
   def handle_event(:input, %Events.Reset{}, _ctx, %State{} = state) do
-    case state.tick_actions do
-      [] when state.timer_status == :to_be_started ->
-        {[], state}
-
-      [] when state.timer_status == :running ->
-        {[stop_timer: :timer], %State{state | timer_status: :to_be_started}}
-
-      _many ->
-        {[], %State{state | timer_status: :to_be_stopped}}
-    end
+    {[], %State{state | reference_timestamps: :not_set}}
   end
 
   @impl true
@@ -106,7 +109,7 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_event(:input, event, _ctx, %State{} = state) do
-    {[], %State{state | tick_actions: [event: {:output, event}] ++ state.tick_actions}}
+    {[], %State{state | tick_actions: [{:event, {:output, event}} | state.tick_actions]}}
   end
 
   @impl true
@@ -117,7 +120,10 @@ defmodule Membrane.Realtimer do
   @impl true
   def handle_stream_format(:input, stream_format, _ctx, %State{} = state) do
     {[],
-     %State{state | tick_actions: [stream_format: {:output, stream_format}] ++ state.tick_actions}}
+     %State{
+       state
+       | tick_actions: [{:stream_format, {:output, stream_format}} | state.tick_actions]
+     }}
   end
 
   @impl true
@@ -127,22 +133,6 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_end_of_stream(:input, _ctx, %State{} = state) do
-    {[], %State{state | tick_actions: [end_of_stream: :output] ++ state.tick_actions}}
-  end
-
-  @impl true
-  def handle_tick(:timer, ctx, %State{} = state) do
-    actions =
-      [timer_interval: {:timer, :no_interval}] ++
-        Enum.reverse(state.tick_actions) ++
-        if ctx.pads.input.end_of_stream?, do: [], else: [demand: :input]
-
-    {maybe_stop_timer, state} =
-      case state.timer_status do
-        :to_be_stopped -> {[stop_timer: :timer], %State{state | timer_status: :to_be_started}}
-        :running -> {[], state}
-      end
-
-    {actions ++ maybe_stop_timer, %State{state | tick_actions: []}}
+    {[], %State{state | tick_actions: [{:end_of_stream, :output} | state.tick_actions]}}
   end
 end
