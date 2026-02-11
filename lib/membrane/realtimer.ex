@@ -9,7 +9,7 @@ defmodule Membrane.Realtimer do
   use Membrane.Filter
 
   alias __MODULE__.Events
-  alias Membrane.Buffer
+  alias Membrane.{Buffer, Time}
 
   def_input_pad :input,
     accepted_format: _any,
@@ -21,8 +21,9 @@ defmodule Membrane.Realtimer do
     flow_control: :push
 
   def_options latency: [
-                spec: Membrane.Time.non_neg(),
+                spec: Time.non_neg(),
                 default: 0,
+                inspector: &Time.inspect/1,
                 description: """
                 Artificial latency that this element will add to the stream. The purpose of this it
                 to handle cases where the incoming stream can get lagged, for example when an
@@ -38,8 +39,8 @@ defmodule Membrane.Realtimer do
     @type t :: %__MODULE__{
             reference_timestamps:
               %{
-                system: Membrane.Time.non_neg(),
-                stream: Membrane.Time.non_neg()
+                system: Time.non_neg(),
+                stream: Time.non_neg()
               }
               | :to_be_determined,
             pending_actions: [Membrane.Element.Action.t()]
@@ -71,7 +72,7 @@ defmodule Membrane.Realtimer do
         %State{
           state
           | reference_timestamps: %{
-              system: Membrane.Time.monotonic_time(),
+              system: Time.monotonic_time(),
               stream: Buffer.get_dts_or_pts(buffer)
             }
         }
@@ -83,9 +84,9 @@ defmodule Membrane.Realtimer do
     target_time = state.reference_timestamps.system + buffer_relative_timestamp + state.latency
 
     interval =
-      (target_time - Membrane.Time.monotonic_time())
+      (target_time - Time.monotonic_time())
       |> max(0)
-      |> Membrane.Time.as_milliseconds(:round)
+      |> Time.as_milliseconds(:round)
 
     Process.send_after(self(), :execute_pending_actions, interval)
 
