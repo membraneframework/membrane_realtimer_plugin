@@ -40,11 +40,11 @@ defmodule Membrane.Realtimer do
             max_latency: Time.non_neg(),
             current_substream_id: non_neg_integer(),
             offset: Time.non_neg() | :calculating,
+            newest_timestamp: Time.non_neg(),
             substreams: %{
               non_neg_integer() =>
                 %{
-                  oldest_queued_timestamp: Time.non_neg(),
-                  newest_queued_timestamp: Time.non_neg(),
+                  finished: boolean(),
                   reference_timestamps: %{
                     absolute: Time.non_neg(),
                     stream: Time.non_neg()
@@ -63,7 +63,8 @@ defmodule Membrane.Realtimer do
                 [
                   current_substream_id: 0,
                   substreams: %{0 => :to_be_initialized},
-                  offset: :calculating
+                  offset: :calculating,
+                  newest_timestamp: 0
                 ]
   end
 
@@ -94,7 +95,17 @@ defmodule Membrane.Realtimer do
   #
   # a new substream should have a reference absolute timestamp set to the target_time of the last
   # timestamp of previous substream
-  #
+
+  @impl true
+  def handle_start_of_stream(:input, _ctx, %State{} = state) do
+    Process.send_after(
+      self(),
+      :initial_latency_passed,
+      Time.as_milliseconds(state.max_latency, :round)
+    )
+
+    {[], state}
+  end
 
   @impl true
   def handle_buffer(:input, buffer, _ctx, %State{} = state) do
@@ -104,14 +115,6 @@ defmodule Membrane.Realtimer do
     substream =
       case state.substreams[state.current_substream_id] do
         :to_be_initialized ->
-          if state.offset == :calculating do
-            Process.send_after(
-              self(),
-              {:initial_latency_passed, state.current_substream_id},
-              Time.as_milliseconds(state.max_latency, :round)
-            )
-          end
-
           absolute_reference_timestamp =
             if state.current_substream_id == 0 do
               monotonic_time
@@ -119,15 +122,14 @@ defmodule Membrane.Realtimer do
               previous_substream = state.substreams[state.current_substream_id - 1]
 
               previous_substream_length =
-                previous_substream.newest_queued_timestamp -
+                state.newest_timestamp -
                   previous_substream.reference_timestamps.stream
 
               previous_substream.reference_timestamps.absolute + previous_substream_length
             end
 
           %{
-            oldest_queued_timestamp: buffer_timestamp,
-            newest_queued_timestamp: buffer_timestamp,
+            finished: false,
             reference_timestamps: %{
               absolute: absolute_reference_timestamp,
               stream: buffer_timestamp
@@ -140,22 +142,15 @@ defmodule Membrane.Realtimer do
         initialized_substream ->
           %{
             initialized_substream
-            | newest_queued_timestamp: buffer_timestamp,
-              action_batches_queue: [
+            | action_batches_queue: [
                 %{timestamp: buffer_timestamp, actions: [buffer: {:output, buffer}]}
                 | initialized_substream.action_batches_queue
               ]
           }
       end
 
-    substream =
-      if substream.oldest_queued_timestamp == nil do
-        %{substream | oldest_queued_timestamp: buffer_timestamp}
-      else
-        substream
-      end
-
-    substream_duration = substream.newest_queued_timestamp - substream.oldest_queued_timestamp
+    %State{} = state = put_in(state.substreams[state.current_substream_id], substream)
+    substream_duration = calculate_substream_duration(substream.action_batches_queue)
 
     demand_action =
       if substream_duration < state.max_latency do
@@ -167,25 +162,42 @@ defmodule Membrane.Realtimer do
     state =
       if state.offset == :calculating do
         if substream_duration >= state.max_latency do
-          state = %State{state | offset: monotonic_time - substream.reference_timestamps.absolute}
-
-          IO.inspect("xx")
-
-          Enum.each(
-            substream.action_batches_queue,
-            &schedule_next_pop(&1.timestamp, state.offset, substream, state.current_substream_id)
-          )
-
-          state
+          %State{state | offset: monotonic_time - substream.reference_timestamps.absolute}
+          |> apply_calculated_offset()
         else
           state
         end
       else
-        IO.inspect("cc")
-        schedule_next_pop(buffer_timestamp, state.offset, substream, state.current_substream_id)
+        schedule_next_buffer(
+          buffer_timestamp,
+          state.offset,
+          substream,
+          state.current_substream_id
+        )
+
         state
       end
 
+    # state =
+    #   cond do
+    #     state.offset != :calculating ->
+    #       schedule_next_buffer(buffer_timestamp, state.offset, substream, state.current_substream_id)
+    #       state
+    #
+    #     substream_duration >= state.max_latency ->
+    #       offset = monotonic_time - substream.reference_timestamps.absolute
+    #
+    #       Enum.each(
+    #         substream.action_batches_queue,
+    #         &schedule_next_buffer(&1.timestamp, offset, substream, state.current_substream_id)
+    #       )
+    #
+    #       %State{state | offset: offset}
+    #
+    #     true ->
+    #       state
+    #   end
+    #
     #
     # {demand_action, state} =
     #   cond do
@@ -199,30 +211,44 @@ defmodule Membrane.Realtimer do
     #
     #       Enum.each(
     #         substream.action_batches_queue,
-    #         &schedule_next_pop(&1.timestamp, state.offset, substream, state.current_substream_id)
+    #         &schedule_next_buffer(&1.timestamp, state.offset, substream, state.current_substream_id)
     #       )
     #
     #       {[], state}
     #
     #     state.offset != :calculating and substream_duration < state.max_latency ->
-    #       schedule_next_pop(buffer_timestamp, state.offset, substream, state.current_substream_id)
+    #       schedule_next_buffer(buffer_timestamp, state.offset, substream, state.current_substream_id)
     #       {[demand: :input], state}
     #
     #     state.offset != :calculating and substream_duration >= state.max_latency ->
-    #       schedule_next_pop(buffer_timestamp, state.offset, substream, state.current_substream_id)
+    #       schedule_next_buffer(buffer_timestamp, state.offset, substream, state.current_substream_id)
     #       {[], state}
     #   end
 
     IO.inspect(buffer, label: "handle_buffer buffer")
 
-    state = put_in(state.substreams[state.current_substream_id], substream)
+    state = %State{state | newest_timestamp: buffer_timestamp}
 
     IO.inspect(state.substreams, label: "substream")
 
     {demand_action, state}
   end
 
-  defp schedule_next_pop(buffer_timestamp, offset, substream, current_substream_id) do
+  defp calculate_substream_duration(action_batches_queue) do
+    case action_batches_queue do
+      [] ->
+        0
+
+      [_single_action_batch] ->
+        0
+
+      [newest_action_batch | rest_of_action_batches] ->
+        newest_action_batch.timestamp -
+          List.last(rest_of_action_batches).timestamp
+    end
+  end
+
+  defp schedule_next_buffer(buffer_timestamp, offset, substream, current_substream_id) do
     buffer_relative_timestamp =
       buffer_timestamp - substream.reference_timestamps.stream
 
@@ -237,40 +263,34 @@ defmodule Membrane.Realtimer do
     IO.inspect(interval, label: "interval")
     IO.inspect(current_substream_id, label: "scheduled id")
 
-    Process.send_after(
-      self(),
-      {:pop_action_batches_queue, current_substream_id},
-      interval
+    Process.send_after(self(), {:send_next_buffer, current_substream_id}, interval)
+  end
+
+  defp apply_calculated_offset(state) do
+    Enum.each(
+      state.substreams[0].action_batches_queue,
+      &schedule_next_buffer(&1.timestamp, state.offset, state.substreams[0], 0)
     )
+
+    state
   end
 
   @impl true
-  def handle_info({:initial_latency_passed, substream_id}, _ctx, %State{} = state) do
+  def handle_info(:initial_latency_passed, _ctx, %State{} = state) do
     # exceeded max latency, set substream offset to max_latency
-    substream = state.substreams[substream_id]
-
-    offset =
+    state =
       if state.offset == :calculating do
-        Enum.each(
-          substream.action_batches_queue,
-          &schedule_next_pop(
-            &1.timestamp,
-            state.max_latency,
-            substream,
-            state.current_substream_id
-          )
-        )
-
-        state.max_latency
+        %State{state | offset: state.max_latency}
+        |> apply_calculated_offset()
       else
-        state.offset
+        state
       end
 
-    {[], %State{state | offset: offset}}
+    {[], state}
   end
 
   @impl true
-  def handle_info({:pop_action_batches_queue, substream_id}, ctx, %State{} = state) do
+  def handle_info({:send_next_buffer, substream_id}, ctx, %State{} = state) do
     substream = state.substreams[substream_id]
 
     {oldest_action_batch, rest_of_action_batches} =
@@ -279,29 +299,15 @@ defmodule Membrane.Realtimer do
     actions =
       Enum.reverse(oldest_action_batch.actions) |> IO.inspect(label: "oldest_action_batch")
 
-    {oldest_queued_timestamp, substream_duration} =
-      case Enum.at(rest_of_action_batches, -1) do
-        nil ->
-          {nil, 0}
+    substream = %{substream | action_batches_queue: rest_of_action_batches}
 
-        oldest_action_batch ->
-          substream_duration =
-            substream.newest_queued_timestamp - oldest_action_batch.timestamp
-
-          {oldest_action_batch.timestamp, substream_duration}
-      end
-
-    substream = %{
-      substream
-      | oldest_queued_timestamp: oldest_queued_timestamp,
-        action_batches_queue: rest_of_action_batches
-    }
+    substream_duration = calculate_substream_duration(substream.action_batches_queue)
 
     IO.inspect(ctx.pads.input.manual_demand_size, label: "ctx")
 
     demand_action =
       if ctx.pads.input.end_of_stream? or ctx.pads.input.manual_demand_size > 0 or
-           substream_duration > state.max_latency do
+           substream_duration > state.max_latency or substream.finished do
         []
       else
         [demand: :input]
@@ -313,14 +319,19 @@ defmodule Membrane.Realtimer do
   end
 
   @impl true
-  def handle_event(:input, %Events.Reset{}, _ctx, %State{} = state) do
+  def handle_event(:input, %Events.Reset{}, ctx, %State{} = state) do
     IO.inspect("reset")
     new_substream_id = state.current_substream_id + 1
 
+    state = update_in(state.substreams[state.current_substream_id], &%{&1 | finished: true})
     state = update_in(state.substreams, &Map.put(&1, new_substream_id, :to_be_initialized))
     state = put_in(state.current_substream_id, new_substream_id)
 
-    {[], state}
+    if ctx.pads.input.manual_demand_size == 0 do
+      {[demand: :input], state}
+    else
+      {[], state}
+    end
   end
 
   @impl true
