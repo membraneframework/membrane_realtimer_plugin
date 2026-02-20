@@ -20,16 +20,19 @@ defmodule Membrane.Realtimer do
     accepted_format: _any,
     flow_control: :push
 
-  def_options latency: [
+  def_options max_latency: [
                 spec: Time.non_neg(),
                 default: 0,
                 inspector: &Time.inspect/1,
                 description: """
-                Artificial latency that this element will add to the stream. The purpose of this it
-                to handle cases where the incoming stream can get lagged, for example when an
-                element up the pipeline can get held up for some time and then produce all the
-                "late" buffers at once. The latency gives Realtimer some margin in waiting
-                for those "late" buffers, so that the outgoing stream is still smooth.
+                This element will keep a part of the stream of duration specified by this option
+                buffered. The purpose of this it to handle cases where the incoming stream can get
+                lagged, for example when an element up the pipeline can get held up for some time
+                and then produce all the "late" media at once. The buffered stream gives Realtimer some
+                margin in waiting for this "late" media, so that the outgoing stream is still smooth.
+                The initial accumulation of the buffer can introduce some latency, especially when
+                the input stream is in realtime, but it will never exceed the amount provided via this
+                option.
                 """
               ]
 
@@ -41,14 +44,14 @@ defmodule Membrane.Realtimer do
             current_substream_id: non_neg_integer(),
             offset: Time.non_neg() | :calculating,
             newest_timestamp: Time.non_neg(),
+            reference_timestamps: %{
+              absolute: Time.non_neg() | :to_be_initialized,
+              stream: Time.non_neg() | :to_be_initialized
+            },
             substreams: %{
               non_neg_integer() =>
                 %{
                   finished: boolean(),
-                  reference_timestamps: %{
-                    absolute: Time.non_neg(),
-                    stream: Time.non_neg()
-                  },
                   action_batches_queue: [
                     %{timestamp: Time.non_neg(), actions: [Membrane.Element.Action.t()]}
                   ]
@@ -62,6 +65,10 @@ defmodule Membrane.Realtimer do
     defstruct @enforce_keys ++
                 [
                   current_substream_id: 0,
+                  reference_timestamps: %{
+                    absolute: :to_be_initialized,
+                    stream: :to_be_initialized
+                  },
                   substreams: %{0 => :to_be_initialized},
                   offset: :calculating,
                   newest_timestamp: 0
@@ -70,31 +77,13 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_init(_ctx, opts) do
-    {[], %State{max_latency: opts.latency}}
+    {[], %State{max_latency: opts.max_latency}}
   end
 
   @impl true
   def handle_playing(_ctx, state) do
     {[demand: :input], state}
   end
-
-  # max_latency indicates how much duration the realtimer should buffer.
-  # when the first buffer arrives we should start calculating the offset and until we do, we should
-  # keep demanding buffers.
-  # when the realtimer buffers `max_latency` long stream, we set the offset to the time
-  # elapsed from receiving the first buffer.
-  # if the time elapsed exceeds `max_latency` before enough stream is buffered, we set
-  # the offset to `max_latency`.
-  # Now we should schedule sending the queued buffers and from now on, we should schedule
-  # sending new buffers as they arrive. We also should stop demanding buffers when a buffer arrives,
-  # but when a buffer is sent and the queued duration is shorter than `max_latency`
-  #
-  # when a reset event arrives we should create a new substream and demand until it's
-  # is as long as `max_latency`. We should do that in general and keep track if a buffer
-  # has been demanded or not.
-  #
-  # a new substream should have a reference absolute timestamp set to the target_time of the last
-  # timestamp of previous substream
 
   @impl true
   def handle_start_of_stream(:input, _ctx, %State{} = state) do
@@ -112,28 +101,13 @@ defmodule Membrane.Realtimer do
     buffer_timestamp = Buffer.get_dts_or_pts(buffer)
     monotonic_time = Time.monotonic_time()
 
+    state = initialize_uninitialized_reference_timestamps(buffer_timestamp, monotonic_time, state)
+
     substream =
       case state.substreams[state.current_substream_id] do
         :to_be_initialized ->
-          absolute_reference_timestamp =
-            if state.current_substream_id == 0 do
-              monotonic_time
-            else
-              previous_substream = state.substreams[state.current_substream_id - 1]
-
-              previous_substream_length =
-                state.newest_timestamp -
-                  previous_substream.reference_timestamps.stream
-
-              previous_substream.reference_timestamps.absolute + previous_substream_length
-            end
-
           %{
             finished: false,
-            reference_timestamps: %{
-              absolute: absolute_reference_timestamp,
-              stream: buffer_timestamp
-            },
             action_batches_queue: [
               %{timestamp: buffer_timestamp, actions: [buffer: {:output, buffer}]}
             ]
@@ -159,151 +133,106 @@ defmodule Membrane.Realtimer do
         []
       end
 
-    state =
-      if state.offset == :calculating do
-        if substream_duration >= state.max_latency do
-          %State{state | offset: monotonic_time - substream.reference_timestamps.absolute}
-          |> apply_calculated_offset()
-        else
-          state
-        end
-      else
-        schedule_next_buffer(
-          buffer_timestamp,
-          state.offset,
-          substream,
-          state.current_substream_id
-        )
+    if state.offset != :calculating do
+      schedule_next_buffer(
+        buffer_timestamp,
+        state.offset,
+        state.reference_timestamps,
+        state.current_substream_id
+      )
+    end
 
+    state =
+      if substream_duration >= state.max_latency do
+        accumulation_time = monotonic_time - state.reference_timestamps.absolute
+        lock_offset_if_still_calculating(accumulation_time, state)
+      else
         state
       end
 
-    # state =
-    #   cond do
-    #     state.offset != :calculating ->
-    #       schedule_next_buffer(buffer_timestamp, state.offset, substream, state.current_substream_id)
-    #       state
-    #
-    #     substream_duration >= state.max_latency ->
-    #       offset = monotonic_time - substream.reference_timestamps.absolute
-    #
-    #       Enum.each(
-    #         substream.action_batches_queue,
-    #         &schedule_next_buffer(&1.timestamp, offset, substream, state.current_substream_id)
-    #       )
-    #
-    #       %State{state | offset: offset}
-    #
-    #     true ->
-    #       state
-    #   end
-    #
-    #
-    # {demand_action, state} =
-    #   cond do
-    #     state.offset == :calculating and substream_duration < state.max_latency ->
-    #       {[demand: :input], state}
-    #
-    #     state.offset == :calculating and substream_duration >= state.max_latency ->
-    #       # accumulated substream longer than max_latency,
-    #       # set offset to the elapsed time from absolute reference
-    #       state = %State{state | offset: monotonic_time - substream.reference_timestamps.absolute}
-    #
-    #       Enum.each(
-    #         substream.action_batches_queue,
-    #         &schedule_next_buffer(&1.timestamp, state.offset, substream, state.current_substream_id)
-    #       )
-    #
-    #       {[], state}
-    #
-    #     state.offset != :calculating and substream_duration < state.max_latency ->
-    #       schedule_next_buffer(buffer_timestamp, state.offset, substream, state.current_substream_id)
-    #       {[demand: :input], state}
-    #
-    #     state.offset != :calculating and substream_duration >= state.max_latency ->
-    #       schedule_next_buffer(buffer_timestamp, state.offset, substream, state.current_substream_id)
-    #       {[], state}
-    #   end
-
-    IO.inspect(buffer, label: "handle_buffer buffer")
-
     state = %State{state | newest_timestamp: buffer_timestamp}
-
-    IO.inspect(state.substreams, label: "substream")
 
     {demand_action, state}
   end
 
+  defp initialize_uninitialized_reference_timestamps(
+         buffer_timestamp,
+         monotonic_time,
+         %State{} = state
+       ) do
+    absolute_timestamp =
+      if state.reference_timestamps.absolute == :to_be_initialized,
+        do: monotonic_time,
+        else: state.reference_timestamps.absolute
+
+    stream_timestamp =
+      if state.reference_timestamps.stream == :to_be_initialized,
+        do: buffer_timestamp,
+        else: state.reference_timestamps.stream
+
+    %State{
+      state
+      | reference_timestamps: %{absolute: absolute_timestamp, stream: stream_timestamp}
+    }
+  end
+
   defp calculate_substream_duration(action_batches_queue) do
-    case action_batches_queue do
-      [] ->
-        0
-
-      [_single_action_batch] ->
-        0
-
-      [newest_action_batch | rest_of_action_batches] ->
-        newest_action_batch.timestamp -
-          List.last(rest_of_action_batches).timestamp
+    if length(action_batches_queue) < 2 do
+      0
+    else
+      List.first(action_batches_queue).timestamp - List.last(action_batches_queue).timestamp
     end
   end
 
-  defp schedule_next_buffer(buffer_timestamp, offset, substream, current_substream_id) do
+  defp schedule_next_buffer(buffer_timestamp, offset, reference_timestamps, current_substream_id) do
     buffer_relative_timestamp =
-      buffer_timestamp - substream.reference_timestamps.stream
+      buffer_timestamp - reference_timestamps.stream
 
     target_time =
-      substream.reference_timestamps.absolute + buffer_relative_timestamp + offset
+      reference_timestamps.absolute + buffer_relative_timestamp + offset
 
     interval =
       (target_time - Time.monotonic_time())
       |> max(0)
       |> Time.as_milliseconds(:round)
 
-    IO.inspect(interval, label: "interval")
-    IO.inspect(current_substream_id, label: "scheduled id")
-
-    Process.send_after(self(), {:send_next_buffer, current_substream_id}, interval)
+    Process.send_after(self(), {:send_next_action_batch, current_substream_id}, interval)
   end
 
-  defp apply_calculated_offset(state) do
-    Enum.each(
-      state.substreams[0].action_batches_queue,
-      &schedule_next_buffer(&1.timestamp, state.offset, state.substreams[0], 0)
-    )
+  defp lock_offset_if_still_calculating(offset, %State{} = state) do
+    if state.offset == :calculating do
+      state = %State{state | offset: offset}
 
-    state
+      Enum.each(
+        state.substreams[0].action_batches_queue,
+        &schedule_next_buffer(&1.timestamp, offset, state.reference_timestamps, 0)
+      )
+
+      state
+    else
+      state
+    end
   end
 
   @impl true
   def handle_info(:initial_latency_passed, _ctx, %State{} = state) do
-    # exceeded max latency, set substream offset to max_latency
-    state =
-      if state.offset == :calculating do
-        %State{state | offset: state.max_latency}
-        |> apply_calculated_offset()
-      else
-        state
-      end
+    state = lock_offset_if_still_calculating(state.max_latency, state)
 
     {[], state}
   end
 
   @impl true
-  def handle_info({:send_next_buffer, substream_id}, ctx, %State{} = state) do
+  def handle_info({:send_next_action_batch, substream_id}, ctx, %State{} = state) do
     substream = state.substreams[substream_id]
 
     {oldest_action_batch, rest_of_action_batches} =
       List.pop_at(substream.action_batches_queue, -1)
 
-    actions =
-      Enum.reverse(oldest_action_batch.actions) |> IO.inspect(label: "oldest_action_batch")
+    actions = Enum.reverse(oldest_action_batch.actions)
 
     substream = %{substream | action_batches_queue: rest_of_action_batches}
 
     substream_duration = calculate_substream_duration(substream.action_batches_queue)
-
-    IO.inspect(ctx.pads.input.manual_demand_size, label: "ctx")
 
     demand_action =
       if ctx.pads.input.end_of_stream? or ctx.pads.input.manual_demand_size > 0 or
@@ -320,12 +249,25 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_event(:input, %Events.Reset{}, ctx, %State{} = state) do
-    IO.inspect("reset")
-    new_substream_id = state.current_substream_id + 1
+    accumulation_time = Time.monotonic_time() - state.reference_timestamps.absolute
+    state = lock_offset_if_still_calculating(accumulation_time, state)
 
     state = update_in(state.substreams[state.current_substream_id], &%{&1 | finished: true})
-    state = update_in(state.substreams, &Map.put(&1, new_substream_id, :to_be_initialized))
-    state = put_in(state.current_substream_id, new_substream_id)
+
+    state = update_in(state.current_substream_id, &(&1 + 1))
+
+    state =
+      update_in(state.substreams, &Map.put(&1, state.current_substream_id, :to_be_initialized))
+
+    previous_substream_length =
+      state.newest_timestamp - state.reference_timestamps.stream
+
+    reference_timestamps = %{
+      absolute: state.reference_timestamps.absolute + previous_substream_length,
+      stream: :to_be_initialized
+    }
+
+    state = put_in(state.reference_timestamps, reference_timestamps)
 
     if ctx.pads.input.manual_demand_size == 0 do
       {[demand: :input], state}

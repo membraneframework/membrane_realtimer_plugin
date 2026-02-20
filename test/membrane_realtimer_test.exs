@@ -118,7 +118,6 @@ defmodule Membrane.RealtimerTest do
 
   defp test_scenario(action_batches, max_latency, assertions_fun) do
     generator_fun = fn action_batches_left, demand ->
-      IO.inspect(demand, label: "dupaaaaa")
       Enum.split(List.flatten(action_batches_left), demand)
     end
 
