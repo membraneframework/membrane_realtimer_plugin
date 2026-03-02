@@ -44,12 +44,11 @@ defmodule Membrane.Realtimer do
 
       @type t :: %__MODULE__{
               finished: boolean(),
-              action_batches_queue: [
-                %{timestamp: Time.non_neg(), actions: [Membrane.Element.Action.t()]}
-              ]
+              # Should be Qex.t(%{timestamp: Time.non_neg(), actions: [Membrane.Element.Action.t()]}), but dialyzer can't handle that
+              action_batches_queue: Qex.t()
             }
 
-      defstruct finished: false, action_batches_queue: []
+      defstruct finished: false, action_batches_queue: Qex.new()
     end
 
     @type t :: %__MODULE__{
@@ -109,7 +108,7 @@ defmodule Membrane.Realtimer do
       state =
       update_in(
         state.substreams[state.current_substream_id].action_batches_queue,
-        &[new_action_batch | &1]
+        &Qex.push(&1, new_action_batch)
       )
 
     substream_duration =
@@ -148,14 +147,14 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_info({:send_scheduled_action_batch, substream_id}, ctx, %State{} = state) do
-    substream = state.substreams[substream_id]
+    %State.Substream{} = substream = state.substreams[substream_id]
 
     {oldest_action_batch, rest_of_action_batches} =
-      List.pop_at(substream.action_batches_queue, -1)
+      Qex.pop!(substream.action_batches_queue)
 
     actions = Enum.reverse(oldest_action_batch.actions)
 
-    substream = %{substream | action_batches_queue: rest_of_action_batches}
+    substream = %State.Substream{substream | action_batches_queue: rest_of_action_batches}
 
     substream_duration = calculate_substream_duration(substream)
 
@@ -235,11 +234,12 @@ defmodule Membrane.Realtimer do
 
   @spec calculate_substream_duration(State.Substream.t()) :: Membrane.Time.t()
   defp calculate_substream_duration(substream) do
-    if length(substream.action_batches_queue) < 2 do
-      0
-    else
-      List.first(substream.action_batches_queue).timestamp -
-        List.last(substream.action_batches_queue).timestamp
+    case {Qex.last(substream.action_batches_queue), Qex.first(substream.action_batches_queue)} do
+      {:empty, :empty} ->
+        0
+
+      {{:value, latest_action_batch}, {:value, oldest_action_batch}} ->
+        latest_action_batch.timestamp - oldest_action_batch.timestamp
     end
   end
 
@@ -282,16 +282,22 @@ defmodule Membrane.Realtimer do
   @spec maybe_queue_action(Membrane.Element.Action.t(), State.t()) ::
           {[Membrane.Element.Action.t()], State.t()}
   defp maybe_queue_action(action, state) do
-    if state.substreams[state.current_substream_id].action_batches_queue == [] do
-      {[action], state}
-    else
-      state =
-        update_in(state.substreams[state.current_substream_id].action_batches_queue, fn
-          action_batches_queue ->
-            List.update_at(action_batches_queue, 0, &%{&1 | actions: [action | &1.actions]})
-        end)
+    case Qex.pop_back(state.substreams[state.current_substream_id].action_batches_queue) do
+      {:empty, _queue} ->
+        {[action], state}
 
-      {[], state}
+      {{:value, latest_action_batch}, action_batches_queue} ->
+        latest_action_batch = update_in(latest_action_batch.actions, &[action | &1])
+
+        action_batches_queue = Qex.push(action_batches_queue, latest_action_batch)
+
+        state =
+          put_in(
+            state.substreams[state.current_substream_id].action_batches_queue,
+            action_batches_queue
+          )
+
+        {[], state}
     end
   end
 end
