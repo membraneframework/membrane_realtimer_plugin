@@ -8,319 +8,283 @@ defmodule Membrane.RealtimerTest do
   alias Membrane.Realtimer.Events.Reset
 
   test "Limits playback speed to realtime" do
-    action_batches = [
-      [buffer: {:output, %Buffer{pts: 0, payload: 0}}],
-      [
-        buffer: {:output, %Buffer{pts: Time.milliseconds(100), payload: 1}},
-        end_of_stream: :output
-      ]
+    instructions = [
+      buffer: {0, 0},
+      buffer: {1, 200},
+      buffer: {2, 400},
+      buffer: {3, 600},
+      buffer: {4, 800}
     ]
 
-    assertions_fun = fn pipeline ->
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0})
-      refute_sink_buffer(pipeline, :sink, _buffer, 90)
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
-      assert_end_of_stream(pipeline, :sink)
-    end
+    assertions = [
+      assert: {0, 20},
+      refute: 190,
+      assert: {1, 20},
+      refute: 190,
+      assert: {2, 20},
+      refute: 190,
+      assert: {3, 20},
+      refute: 190,
+      assert: {4, 20}
+    ]
 
-    test_scenario(action_batches, 0, assertions_fun)
+    test_scenario(instructions, assertions, 0)
   end
 
-  test "Limits playback to realtime with introduced initial latency" do
-    action_batches = [
-      [buffer: {:output, %Buffer{pts: 0, payload: 0}}],
-      [
-        buffer: {:output, %Buffer{pts: Time.milliseconds(100), payload: 1}},
-        end_of_stream: :output
-      ]
+  test "Limits playback to realtime with max_latency set" do
+    instructions = [
+      buffer: {0, 0},
+      buffer: {1, 200},
+      buffer: {2, 400},
+      buffer: {3, 600},
+      buffer: {4, 800}
     ]
 
-    assertions_fun = fn pipeline ->
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0}, 20)
-      refute_sink_buffer(pipeline, :sink, _buffer, 90)
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
-      assert_end_of_stream(pipeline, :sink)
-    end
-
-    test_scenario(action_batches, Time.milliseconds(200), assertions_fun)
-  end
-
-  test "Starts following the time of the first buffer" do
-    action_batches = [
-      [
-        buffer: {:output, %Buffer{pts: Time.seconds(10), payload: 0}},
-        end_of_stream: :output
-      ]
+    assertions = [
+      assert: {0, 20},
+      refute: 190,
+      assert: {1, 20},
+      refute: 190,
+      assert: {2, 20},
+      refute: 190,
+      assert: {3, 20},
+      refute: 190,
+      assert: {4, 20}
     ]
 
-    assertions_fun = fn pipeline ->
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0}, 200)
-      assert_end_of_stream(pipeline, :sink)
-    end
-
-    test_scenario(action_batches, 0, assertions_fun)
+    test_scenario(instructions, assertions, Time.milliseconds(500))
   end
 
   test "Correctly reacts to Reset event" do
-    action_batches = [
-      [buffer: {:output, %Buffer{pts: 0, payload: 0}}],
+    instructions =
       [
-        buffer: {:output, %Buffer{pts: Time.milliseconds(100), payload: 1}},
-        event: {:output, %Reset{}}
-      ],
-      [buffer: {:output, %Buffer{pts: Time.milliseconds(800), payload: 2}}],
-      [
-        buffer: {:output, %Buffer{pts: Time.milliseconds(900), payload: 3}},
-        end_of_stream: :output
+        buffer: {0, 0},
+        buffer: {1, 200},
+        event: :reset,
+        buffer: {2, 0},
+        buffer: {3, 200}
       ]
+
+    assertions = [
+      assert: {0, 20},
+      refute: 190,
+      assert: {1, 20},
+      assert: {2, 20},
+      refute: 190,
+      assert: {3, 20}
     ]
 
-    assertions_fun = fn pipeline ->
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0})
-      refute_sink_buffer(pipeline, :sink, _buffer, 90)
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 2}, 20)
-      refute_sink_buffer(pipeline, :sink, _buffer, 90)
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 3}, 20)
-      assert_end_of_stream(pipeline, :sink)
-    end
-
-    test_scenario(action_batches, 0, assertions_fun)
+    test_scenario(instructions, assertions, 0)
   end
 
   test "Correctly reacts to Reset event with latency set" do
-    action_batches = [
-      [buffer: {:output, %Buffer{pts: 0, payload: 0}}],
+    instructions =
       [
-        buffer: {:output, %Buffer{pts: Time.milliseconds(200), payload: 1}},
-        event: {:output, %Reset{}}
-      ],
-      [buffer: {:output, %Buffer{pts: Time.milliseconds(400), payload: 2}}],
-      [
-        buffer: {:output, %Buffer{pts: Time.milliseconds(600), payload: 3}},
-        end_of_stream: :output
+        buffer: {0, 0},
+        buffer: {1, 200},
+        event: :reset,
+        buffer: {2, 400},
+        buffer: {3, 600}
       ]
+
+    assertions = [
+      assert: {0, 20},
+      refute: 190,
+      assert: {1, 20},
+      assert: {2, 20},
+      refute: 190,
+      assert: {3, 20}
     ]
 
-    assertions_fun = fn pipeline ->
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0}, 20)
-      refute_sink_buffer(pipeline, :sink, _buffer, 190)
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 2}, 20)
-      refute_sink_buffer(pipeline, :sink, _buffer, 190)
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 3}, 20)
-      assert_end_of_stream(pipeline, :sink)
-    end
-
-    test_scenario(action_batches, Time.milliseconds(200), assertions_fun)
+    test_scenario(instructions, assertions, Time.milliseconds(500))
   end
 
   test "Corretly reacts to realtime input with max_latency set" do
     instructions = [
-      {:buffer, %Buffer{pts: 0, payload: 0}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(200), payload: 1}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(400), payload: 2}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(600), payload: 3}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(800), payload: 4}}
+      buffer: {0, 0},
+      sleep: 200,
+      buffer: {1, 200},
+      sleep: 200,
+      buffer: {2, 400},
+      sleep: 200,
+      buffer: {3, 600},
+      sleep: 200,
+      buffer: {4, 800}
     ]
 
-    spec =
-      child(:src, %Membrane.Realtimer.TimedSource{instructions: instructions})
-      |> child(:realtimer, %Realtimer{max_latency: Time.milliseconds(500)})
-      |> child(:sink, Testing.Sink)
+    assertions = [
+      refute: 490,
+      assert: {0, 20},
+      refute: 190,
+      assert: {1, 20},
+      refute: 190,
+      assert: {2, 20},
+      refute: 190,
+      assert: {3, 20},
+      refute: 190,
+      assert: {4, 20}
+    ]
 
-    pipeline = Testing.Pipeline.start_link_supervised!(spec: spec)
-    assert_sink_stream_format(pipeline, :sink, _stream_format)
-    refute_sink_buffer(pipeline, :sink, _buffer, 490)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 2}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 3}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 4}, 20)
-    assert_end_of_stream(pipeline, :sink)
-
-    Testing.Pipeline.terminate(pipeline)
+    test_scenario(instructions, assertions, Time.milliseconds(500))
   end
 
   test "Correctly reacts to laggy realtime input" do
     instructions = [
-      {:buffer, %Buffer{pts: 0, payload: 0}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(200), payload: 1}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(400), payload: 2}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(600), payload: 3}},
-      {:sleep, Time.milliseconds(400)},
-      {:buffer, %Buffer{pts: Time.milliseconds(800), payload: 4}},
-      {:buffer, %Buffer{pts: Time.milliseconds(1000), payload: 5}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(1200), payload: 6}}
+      buffer: {0, 0},
+      sleep: 200,
+      buffer: {1, 200},
+      sleep: 200,
+      buffer: {2, 400},
+      sleep: 200,
+      buffer: {3, 600},
+      sleep: 400,
+      buffer: {4, 800},
+      buffer: {5, 1000},
+      sleep: 200,
+      buffer: {6, 1200}
     ]
 
-    spec =
-      child(:src, %Membrane.Realtimer.TimedSource{instructions: instructions})
-      |> child(:realtimer, %Realtimer{max_latency: Time.milliseconds(500)})
-      |> child(:sink, Testing.Sink)
+    assertions = [
+      refute: 490,
+      assert: {0, 20},
+      refute: 190,
+      assert: {1, 20},
+      refute: 190,
+      assert: {2, 20},
+      refute: 190,
+      assert: {3, 20},
+      refute: 190,
+      assert: {4, 20},
+      refute: 190,
+      assert: {5, 20}
+    ]
 
-    pipeline = Testing.Pipeline.start_link_supervised!(spec: spec)
-    assert_sink_stream_format(pipeline, :sink, _stream_format)
-    refute_sink_buffer(pipeline, :sink, _buffer, 490)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 2}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 3}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 4}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 5}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 6}, 20)
-    assert_end_of_stream(pipeline, :sink)
-
-    Testing.Pipeline.terminate(pipeline)
+    test_scenario(instructions, assertions, Time.milliseconds(500))
   end
 
   test "Correctly reacts to laggy non-realtime input" do
     instructions = [
-      {:buffer, %Buffer{pts: 0, payload: 0}},
-      {:buffer, %Buffer{pts: Time.milliseconds(200), payload: 1}},
-      {:buffer, %Buffer{pts: Time.milliseconds(400), payload: 2}},
-      {:buffer, %Buffer{pts: Time.milliseconds(600), payload: 3}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(800), payload: 4}},
-      {:sleep, Time.milliseconds(400)},
-      {:buffer, %Buffer{pts: Time.milliseconds(1000), payload: 5}}
+      buffer: {0, 0},
+      buffer: {1, 200},
+      buffer: {2, 400},
+      buffer: {3, 600},
+      sleep: 200,
+      buffer: {4, 800},
+      sleep: 400,
+      buffer: {5, 1000}
     ]
 
-    spec =
-      child(:src, %Membrane.Realtimer.TimedSource{instructions: instructions})
-      |> child(:realtimer, %Realtimer{max_latency: Time.milliseconds(500)})
-      |> child(:sink, Testing.Sink)
+    assertions = [
+      assert: {0, 20},
+      refute: 190,
+      assert: {1, 20},
+      refute: 190,
+      assert: {2, 20},
+      refute: 190,
+      assert: {3, 20},
+      refute: 190,
+      assert: {4, 20},
+      refute: 190,
+      assert: {5, 20}
+    ]
 
-    pipeline = Testing.Pipeline.start_link_supervised!(spec: spec)
-    assert_sink_stream_format(pipeline, :sink, _stream_format)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 2}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 3}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 4}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 5}, 20)
-    assert_end_of_stream(pipeline, :sink)
+    test_scenario(instructions, assertions, Time.milliseconds(500))
   end
 
   test "Correctly reacts to laggy realtime input with reset events" do
     instructions = [
-      {:buffer, %Buffer{pts: 0, payload: 0}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(200), payload: 1}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(400), payload: 2}},
-      {:sleep, Time.milliseconds(400)},
-      {:buffer, %Buffer{pts: Time.milliseconds(600), payload: 3}},
-      {:buffer, %Buffer{pts: Time.milliseconds(800), payload: 4}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(1000), payload: 5}},
-      {:event, %Realtimer.Events.Reset{}},
-      {:buffer, %Buffer{pts: 0, payload: 6}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(200), payload: 7}},
-      {:sleep, Time.milliseconds(400)},
-      {:buffer, %Buffer{pts: Time.milliseconds(400), payload: 8}},
-      {:buffer, %Buffer{pts: Time.milliseconds(600), payload: 9}}
+      buffer: {0, 0},
+      sleep: 200,
+      buffer: {1, 200},
+      sleep: 200,
+      buffer: {2, 400},
+      sleep: 400,
+      buffer: {3, 600},
+      buffer: {4, 800},
+      sleep: 200,
+      buffer: {5, 1000},
+      event: :reset,
+      buffer: {6, 0},
+      sleep: 200,
+      buffer: {7, 200},
+      sleep: 400,
+      buffer: {8, 400},
+      buffer: {9, 600}
     ]
 
-    spec =
-      child(:src, %Membrane.Realtimer.TimedSource{instructions: instructions})
-      |> child(:realtimer, %Realtimer{max_latency: Time.milliseconds(500)})
-      |> child(:sink, Testing.Sink)
+    assertions = [
+      refute: 490,
+      assert: {0, 20},
+      refute: 190,
+      assert: {1, 20},
+      refute: 190,
+      assert: {2, 20},
+      refute: 190,
+      assert: {3, 20},
+      refute: 190,
+      assert: {4, 20},
+      refute: 190,
+      assert: {5, 20},
+      assert: {6, 20},
+      refute: 190,
+      assert: {7, 20},
+      refute: 190,
+      assert: {8, 20}
+    ]
 
-    pipeline = Testing.Pipeline.start_link_supervised!(spec: spec)
-    assert_sink_stream_format(pipeline, :sink, _stream_format)
-    refute_sink_buffer(pipeline, :sink, _buffer, 490)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 2}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 3}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 4}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 5}, 20)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 6}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 7}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 8}, 20)
-    assert_end_of_stream(pipeline, :sink)
+    test_scenario(instructions, assertions, Time.milliseconds(500))
   end
 
   test "Correctly reacts to reset events during offset calculation" do
     instructions = [
-      {:buffer, %Buffer{pts: 0, payload: 0}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(200), payload: 1}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(400), payload: 2}},
-      {:event, %Realtimer.Events.Reset{}},
-      {:buffer, %Buffer{pts: 0, payload: 3}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(200), payload: 4}},
-      {:sleep, Time.milliseconds(200)},
-      {:buffer, %Buffer{pts: Time.milliseconds(400), payload: 5}}
+      buffer: {0, 0},
+      sleep: 200,
+      buffer: {1, 200},
+      sleep: 200,
+      buffer: {2, 400},
+      event: :reset,
+      buffer: {3, 0},
+      sleep: 200,
+      buffer: {4, 200},
+      sleep: 200,
+      buffer: {5, 400}
     ]
 
-    spec =
-      child(:src, %Membrane.Realtimer.TimedSource{instructions: instructions})
-      |> child(:realtimer, %Realtimer{max_latency: Time.milliseconds(700)})
-      |> child(:sink, Testing.Sink)
+    assertions = [
+      refute: 690,
+      assert: {0, 20},
+      refute: 190,
+      assert: {1, 20},
+      refute: 190,
+      assert: {2, 20},
+      assert: {3, 20},
+      refute: 190,
+      assert: {4, 20},
+      refute: 190,
+      assert: {5, 20}
+    ]
 
-    pipeline = Testing.Pipeline.start_link_supervised!(spec: spec)
-    assert_sink_stream_format(pipeline, :sink, _stream_format)
-    # refute_sink_buffer(pipeline, :sink, _buffer, 790)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0})
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 2}, 20)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 3}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 4}, 20)
-    refute_sink_buffer(pipeline, :sink, _buffer, 190)
-    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 5}, 20)
-    assert_end_of_stream(pipeline, :sink)
+    test_scenario(instructions, assertions, Time.milliseconds(700))
   end
 
-  defp test_scenario(action_batches, max_latency, assertions_fun) do
-    generator_fun = fn action_batches_left, demand ->
-      Enum.split(List.flatten(action_batches_left), demand)
-    end
-
+  defp test_scenario(instructions, assertions, max_latency) do
     spec =
-      child(:src, %Testing.Source{output: {action_batches, generator_fun}})
+      child(:src, %Membrane.Realtimer.TimedSource{instructions: instructions})
       |> child(:realtimer, %Realtimer{max_latency: max_latency})
       |> child(:sink, Testing.Sink)
 
     pipeline = Testing.Pipeline.start_link_supervised!(spec: spec)
-    assertions_fun.(pipeline)
+    assert_sink_stream_format(pipeline, :sink, _stream_format)
+
+    Enum.each(assertions, fn
+      {:assert, {payload, timeout}} ->
+        assert_sink_buffer(pipeline, :sink, %Buffer{payload: ^payload}, timeout)
+
+      {:refute, timeout} ->
+        refute_sink_buffer(pipeline, :sink, _buffer, timeout)
+    end)
+
+    assert_end_of_stream(pipeline, :sink)
     Testing.Pipeline.terminate(pipeline)
   end
 end

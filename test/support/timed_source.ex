@@ -2,10 +2,13 @@ defmodule Membrane.Realtimer.TimedSource do
   @moduledoc false
   use Membrane.Source
 
+  alias Membrane.{Buffer, Time}
+  alias Membrane.Realtimer.Events.Reset
+
   @type instruction ::
-          {:buffer, Membrane.Buffer.t()}
-          | {:event, Membrane.Event.t()}
-          | {:sleep, Membrane.Time.non_neg()}
+          {:buffer, pts_ms :: integer()}
+          | :reset
+          | {:sleep, duration_ms :: non_neg_integer()}
 
   def_output_pad :output, accepted_format: _any, flow_control: :push
 
@@ -15,7 +18,19 @@ defmodule Membrane.Realtimer.TimedSource do
 
   @impl true
   def handle_init(_ctx, opts) do
-    {[], %{instructions: opts.instructions}}
+    instructions =
+      Enum.map(opts.instructions, fn
+        {:buffer, {payload, pts}} ->
+          {:buffer, {:output, %Buffer{payload: payload, pts: Time.milliseconds(pts)}}}
+
+        {:event, :reset} ->
+          {:event, {:output, %Reset{}}}
+
+        {:sleep, time} ->
+          {:sleep, Time.milliseconds(time)}
+      end)
+
+    {[], %{instructions: instructions}}
   end
 
   @impl true
@@ -36,10 +51,10 @@ defmodule Membrane.Realtimer.TimedSource do
   end
 
   defp get_actions_to_execute(instructions) do
-    {instructions_to_execute, rest_of_instructions} =
+    {actions_to_execute, rest_of_instructions} =
       Enum.split_while(instructions, fn
         {:sleep, _time} -> false
-        {_intruction, _arg} -> true
+        _other -> true
       end)
 
     {maybe_eos, rest_of_instructions} =
@@ -57,12 +72,6 @@ defmodule Membrane.Realtimer.TimedSource do
           {[end_of_stream: :output], []}
       end
 
-    actions =
-      Enum.map(instructions_to_execute, fn
-        {:buffer, buffer} -> {:buffer, {:output, buffer}}
-        {:event, event} -> {:event, {:output, event}}
-      end)
-
-    {actions ++ maybe_eos, rest_of_instructions}
+    {actions_to_execute ++ maybe_eos, rest_of_instructions}
   end
 end
