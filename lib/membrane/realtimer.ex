@@ -39,35 +39,53 @@ defmodule Membrane.Realtimer do
   defmodule State do
     @moduledoc false
 
-    @type action_batch :: %{timestamp: Time.non_neg(), actions: [Membrane.Element.Action.t()]}
+    defmodule Substream do
+      @moduledoc false
+
+      @type t :: %__MODULE__{
+              action_batches_queue:
+                Qex.t(%{timestamp: Time.non_neg(), actions: [Membrane.Element.Action.t()]}),
+              reference_timestamps: %{
+                absolute: Time.t() | nil,
+                stream: Time.t() | nil
+              }
+            }
+
+      @enforce_keys [:reference_timestamps]
+
+      defstruct @enforce_keys ++
+                  [
+                    action_batches_queue: Qex.new()
+                  ]
+    end
 
     @type t :: %__MODULE__{
             max_latency: Time.non_neg(),
             offset: Time.non_neg() | :calculating,
             newest_timestamp: Time.non_neg(),
-            reference_timestamps: %{
-              absolute: Time.non_neg() | nil,
-              stream: Time.non_neg() | nil
-            },
             current_substream_id: non_neg_integer(),
-            substreams: %{non_neg_integer() => Qex.t(action_batch())}
+            start_of_stream_time: Time.t() | :to_be_determined,
+            substreams: %{non_neg_integer() => Substream.t()}
           }
 
-    @enforce_keys [:max_latency]
+    @enforce_keys [:max_latency, :substreams]
 
     defstruct @enforce_keys ++
                 [
                   current_substream_id: 0,
-                  reference_timestamps: %{absolute: nil, stream: nil},
                   offset: :calculating,
                   newest_timestamp: 0,
-                  substreams: %{0 => Qex.new()}
+                  start_of_stream_time: :to_be_determined
                 ]
   end
 
   @impl true
   def handle_init(_ctx, opts) do
-    {[], %State{max_latency: opts.max_latency}}
+    {[],
+     %State{
+       max_latency: opts.max_latency,
+       substreams: %{0 => %State.Substream{reference_timestamps: %{absolute: nil, stream: nil}}}
+     }}
   end
 
   @impl true
@@ -83,39 +101,35 @@ defmodule Membrane.Realtimer do
       Time.as_milliseconds(state.max_latency, :round)
     )
 
-    {[], state}
+    {[], %State{state | start_of_stream_time: Time.monotonic_time()}}
   end
 
   @impl true
-  def handle_buffer(:input, buffer, _ctx, %State{} = state) do
+  def handle_buffer(:input, buffer, ctx, %State{} = state) do
     buffer_timestamp = Buffer.get_dts_or_pts(buffer)
-    monotonic_time = Time.monotonic_time()
-
-    state = initialize_reference_timestamps(buffer_timestamp, monotonic_time, state)
 
     new_action_batch = %{timestamp: buffer_timestamp, actions: [buffer: {:output, buffer}]}
 
-    %State{} =
-      state =
-      update_in(state.substreams[state.current_substream_id], &Qex.push(&1, new_action_batch))
+    state =
+      update_in(
+        state.substreams[state.current_substream_id].action_batches_queue,
+        &Qex.push(&1, new_action_batch)
+      )
+
+    state = maybe_initialize_reference_timestamps(buffer_timestamp, state)
+
+    if state.offset != :calculating do
+      maybe_schedule_action_batch(buffer_timestamp, state.current_substream_id, state)
+    end
 
     buffered_stream_duration = calculate_buffered_stream_duration(state)
 
-    demand_action =
-      if buffered_stream_duration < state.max_latency do
-        [demand: :input]
-      else
-        []
-      end
+    demand_action = maybe_demand(buffered_stream_duration, ctx, state)
 
-    if state.offset != :calculating do
-      schedule_action_batch(buffer_timestamp, state)
-    end
-
-    state =
+    %State{} =
+      state =
       if buffered_stream_duration >= state.max_latency do
-        accumulation_time = monotonic_time - state.reference_timestamps.absolute
-        lock_offset_if_still_calculating(accumulation_time, state)
+        lock_offset_if_still_calculating(state)
       else
         state
       end
@@ -127,54 +141,56 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_info(:max_latency_passed, _ctx, %State{} = state) do
-    state = lock_offset_if_still_calculating(state.max_latency, state)
+    state = lock_offset_if_still_calculating(state)
 
     {[], state}
   end
 
   @impl true
   def handle_info({:send_scheduled_action_batch, substream_id}, ctx, %State{} = state) do
-    {oldest_action_batch, substream} = Qex.pop!(state.substreams[substream_id])
+    %State.Substream{} = substream = state.substreams[substream_id]
 
-    actions = Enum.reverse(oldest_action_batch.actions)
+    {oldest_action_batch, rest_of_action_batches} =
+      Qex.pop!(substream.action_batches_queue)
 
-    state = put_in(state.substreams[substream_id], substream)
-
-    buffered_stream_duration = calculate_buffered_stream_duration(state)
+    queued_actions = Enum.reverse(oldest_action_batch.actions)
 
     demand_action =
-      if ctx.pads.input.end_of_stream? or ctx.pads.input.manual_demand_size > 0 or
-           buffered_stream_duration > state.max_latency do
-        []
-      else
-        [demand: :input]
-      end
+      calculate_buffered_stream_duration(state)
+      |> maybe_demand(ctx, state)
 
-    {actions ++ demand_action, state}
+    substream = %State.Substream{substream | action_batches_queue: rest_of_action_batches}
+    state = put_in(state.substreams[substream_id], substream)
+
+    {queued_actions ++ demand_action, state}
   end
 
   @impl true
   def handle_event(:input, %Events.Reset{}, ctx, %State{} = state) do
+    finished_substream = state.substreams[state.current_substream_id]
     state = update_in(state.current_substream_id, &(&1 + 1))
 
-    state =
-      update_in(state.substreams, &Map.put(&1, state.current_substream_id, Qex.new()))
-
     previous_substream_length =
-      state.newest_timestamp - state.reference_timestamps.stream
+      state.newest_timestamp - finished_substream.reference_timestamps.stream
 
     reference_timestamps = %{
-      absolute: state.reference_timestamps.absolute + previous_substream_length,
+      absolute: finished_substream.reference_timestamps.absolute + previous_substream_length,
       stream: nil
     }
 
-    state = put_in(state.reference_timestamps, reference_timestamps)
+    state =
+      update_in(
+        state.substreams,
+        &Map.put(&1, state.current_substream_id, %State.Substream{
+          reference_timestamps: reference_timestamps
+        })
+      )
 
-    if ctx.pads.input.manual_demand_size == 0 do
-      {[demand: :input], state}
-    else
-      {[], state}
-    end
+    demand_action =
+      calculate_buffered_stream_duration(state)
+      |> maybe_demand(ctx, state)
+
+    {demand_action, state}
   end
 
   @impl true
@@ -188,31 +204,32 @@ defmodule Membrane.Realtimer do
   end
 
   @impl true
-  def handle_stream_format(:input, stream_format, _ctx, state) do
+  def handle_stream_format(:input, stream_format, _ctx, %State{} = state) do
     maybe_queue_action({:stream_format, {:output, stream_format}}, state)
   end
 
   @impl true
   def handle_end_of_stream(:input, _ctx, %State{} = state) do
+    lock_offset_if_still_calculating(state)
     maybe_queue_action({:end_of_stream, :output}, state)
   end
 
-  @spec initialize_reference_timestamps(Membrane.Time.t(), Membrane.Time.non_neg(), State.t()) ::
+  @spec maybe_initialize_reference_timestamps(Time.t(), State.t()) ::
           State.t()
-  defp initialize_reference_timestamps(buffer_timestamp, monotonic_time, %State{} = state) do
-    %State{
-      state
-      | reference_timestamps: %{
-          absolute: state.reference_timestamps.absolute || monotonic_time,
-          stream: state.reference_timestamps.stream || buffer_timestamp
-        }
-    }
+  defp maybe_initialize_reference_timestamps(buffer_timestamp, %State{} = state) do
+    update_in(
+      state.substreams[state.current_substream_id].reference_timestamps,
+      &%{
+        absolute: &1.absolute || Time.monotonic_time(),
+        stream: &1.stream || buffer_timestamp
+      }
+    )
   end
 
   @spec calculate_buffered_stream_duration(State.t()) :: Membrane.Time.t()
   defp calculate_buffered_stream_duration(state) do
     Enum.sum_by(state.substreams, fn {_substream_id, substream} ->
-      case {Qex.last(substream), Qex.first(substream)} do
+      case {Qex.last(substream.action_batches_queue), Qex.first(substream.action_batches_queue)} do
         {:empty, :empty} ->
           0
 
@@ -222,13 +239,30 @@ defmodule Membrane.Realtimer do
     end)
   end
 
-  @spec schedule_action_batch(Time.t(), State.t()) :: reference()
-  defp schedule_action_batch(buffer_timestamp, state) do
+  @spec maybe_demand(Time.t(), Membrane.Element.CallbackContext.t(), State.t()) ::
+          [Membrane.Element.Action.demand()]
+  defp maybe_demand(buffered_stream_duration, ctx, state) do
+    if ctx.pads.input.end_of_stream? or ctx.pads.input.manual_demand_size > 0 or
+         buffered_stream_duration > state.max_latency do
+      []
+    else
+      [demand: :input]
+    end
+  end
+
+  @spec maybe_schedule_action_batch(Time.t(), non_neg_integer(), State.t()) :: reference() | nil
+  defp maybe_schedule_action_batch(_buffer_timestamp, _substream_id, %State{offset: :calculating}) do
+    nil
+  end
+
+  defp maybe_schedule_action_batch(buffer_timestamp, substream_id, state) do
+    substream = state.substreams[substream_id]
+
     buffer_relative_timestamp =
-      buffer_timestamp - state.reference_timestamps.stream
+      buffer_timestamp - substream.reference_timestamps.stream
 
     target_time =
-      state.reference_timestamps.absolute + buffer_relative_timestamp + state.offset
+      substream.reference_timestamps.absolute + buffer_relative_timestamp + state.offset
 
     send_after_time =
       (target_time - Time.monotonic_time())
@@ -237,18 +271,21 @@ defmodule Membrane.Realtimer do
 
     Process.send_after(
       self(),
-      {:send_scheduled_action_batch, state.current_substream_id},
+      {:send_scheduled_action_batch, substream_id},
       send_after_time
     )
   end
 
-  @spec lock_offset_if_still_calculating(Time.non_neg(), State.t()) :: State.t()
-  defp lock_offset_if_still_calculating(offset, %State{} = state) do
+  @spec lock_offset_if_still_calculating(State.t()) :: State.t()
+  defp lock_offset_if_still_calculating(%State{} = state) do
     if state.offset == :calculating do
-      state = %State{state | offset: offset}
+      state = %State{state | offset: Time.monotonic_time() - state.start_of_stream_time}
 
-      Enum.each(state.substreams, fn {_substream_id, substream} ->
-        Enum.each(substream, &schedule_action_batch(&1.timestamp, state))
+      Enum.each(state.substreams, fn {substream_id, substream} ->
+        Enum.each(
+          substream.action_batches_queue,
+          &maybe_schedule_action_batch(&1.timestamp, substream_id, state)
+        )
       end)
 
       state
@@ -260,19 +297,19 @@ defmodule Membrane.Realtimer do
   @spec maybe_queue_action(Membrane.Element.Action.t(), State.t()) ::
           {[Membrane.Element.Action.t()], State.t()}
   defp maybe_queue_action(action, state) do
-    case Qex.pop_back(state.substreams[state.current_substream_id]) do
+    case Qex.pop_back(state.substreams[state.current_substream_id].action_batches_queue) do
       {:empty, _queue} ->
         {[action], state}
 
-      {{:value, latest_action_batch}, substream} ->
+      {{:value, latest_action_batch}, action_batches_queue} ->
         latest_action_batch = update_in(latest_action_batch.actions, &[action | &1])
 
-        substream = Qex.push(substream, latest_action_batch)
+        action_batches_queue = Qex.push(action_batches_queue, latest_action_batch)
 
         state =
           put_in(
-            state.substreams[state.current_substream_id],
-            substream
+            state.substreams[state.current_substream_id].action_batches_queue,
+            action_batches_queue
           )
 
         {[], state}

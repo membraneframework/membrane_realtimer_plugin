@@ -36,8 +36,7 @@ defmodule Membrane.RealtimerTest do
     ]
 
     assertions_fun = fn pipeline ->
-      refute_sink_buffer(pipeline, :sink, _buffer, 190)
-      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0})
+      assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0}, 20)
       refute_sink_buffer(pipeline, :sink, _buffer, 90)
       assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
       assert_end_of_stream(pipeline, :sink)
@@ -271,6 +270,42 @@ defmodule Membrane.RealtimerTest do
     assert_sink_buffer(pipeline, :sink, %Buffer{payload: 7}, 20)
     refute_sink_buffer(pipeline, :sink, _buffer, 190)
     assert_sink_buffer(pipeline, :sink, %Buffer{payload: 8}, 20)
+    assert_end_of_stream(pipeline, :sink)
+  end
+
+  test "Correctly reacts to reset events during offset calculation" do
+    instructions = [
+      {:buffer, %Buffer{pts: 0, payload: 0}},
+      {:sleep, Time.milliseconds(200)},
+      {:buffer, %Buffer{pts: Time.milliseconds(200), payload: 1}},
+      {:sleep, Time.milliseconds(200)},
+      {:buffer, %Buffer{pts: Time.milliseconds(400), payload: 2}},
+      {:event, %Realtimer.Events.Reset{}},
+      {:buffer, %Buffer{pts: 0, payload: 3}},
+      {:sleep, Time.milliseconds(200)},
+      {:buffer, %Buffer{pts: Time.milliseconds(200), payload: 4}},
+      {:sleep, Time.milliseconds(200)},
+      {:buffer, %Buffer{pts: Time.milliseconds(400), payload: 5}}
+    ]
+
+    spec =
+      child(:src, %Membrane.Realtimer.TimedSource{instructions: instructions})
+      |> child(:realtimer, %Realtimer{max_latency: Time.milliseconds(700)})
+      |> child(:sink, Testing.Sink)
+
+    pipeline = Testing.Pipeline.start_link_supervised!(spec: spec)
+    assert_sink_stream_format(pipeline, :sink, _stream_format)
+    # refute_sink_buffer(pipeline, :sink, _buffer, 790)
+    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 0})
+    refute_sink_buffer(pipeline, :sink, _buffer, 190)
+    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 1}, 20)
+    refute_sink_buffer(pipeline, :sink, _buffer, 190)
+    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 2}, 20)
+    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 3}, 20)
+    refute_sink_buffer(pipeline, :sink, _buffer, 190)
+    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 4}, 20)
+    refute_sink_buffer(pipeline, :sink, _buffer, 190)
+    assert_sink_buffer(pipeline, :sink, %Buffer{payload: 5}, 20)
     assert_end_of_stream(pipeline, :sink)
   end
 
