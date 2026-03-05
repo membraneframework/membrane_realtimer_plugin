@@ -5,7 +5,6 @@ defmodule Membrane.RealtimerTest do
   import Membrane.ChildrenSpec
 
   alias Membrane.{Buffer, Realtimer, Testing, Time}
-  alias Membrane.Realtimer.Events.Reset
 
   test "Limits playback speed to realtime" do
     instructions = [
@@ -310,7 +309,6 @@ defmodule Membrane.RealtimerTest do
           event: :reset
         ]
       end)
-      |> IO.inspect()
 
     assertions =
       [refute: 590] ++
