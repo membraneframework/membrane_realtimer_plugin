@@ -63,7 +63,7 @@ defmodule Membrane.Realtimer do
             max_latency: Time.non_neg(),
             offset: Time.non_neg() | :calculating,
             newest_timestamp: Time.non_neg(),
-            currently_incoming_substream_id: non_neg_integer(),
+            currently_incoming_substream_id: non_neg_integer() | nil,
             start_of_stream_time: Time.t() | nil,
             initialize_new_substream: boolean(),
             substreams: %{non_neg_integer() => Substream.t()}
@@ -73,7 +73,7 @@ defmodule Membrane.Realtimer do
 
     defstruct @enforce_keys ++
                 [
-                  currently_incoming_substream_id: 0,
+                  currently_incoming_substream_id: nil,
                   substreams: %{},
                   initialize_new_substream: true,
                   offset: :calculating,
@@ -127,17 +127,15 @@ defmodule Membrane.Realtimer do
     buffered_stream_duration = calculate_buffered_stream_duration(state)
 
     state =
-      cond do
-        state.offset == :calculating and buffered_stream_duration >= state.max_latency ->
+      if state.offset == :calculating do
+        if buffered_stream_duration >= state.max_latency do
           lock_offset_and_schedule_all_queued_actions(state)
-
-        state.offset == :calculating ->
+        else
           state
-
-        state.offset != :calculating ->
-          schedule_action_batch(buffer_timestamp, state.currently_incoming_substream_id, state)
-
-          state
+        end
+      else
+        schedule_action_batch(buffer_timestamp, state.currently_incoming_substream_id, state)
+        state
       end
 
     demand_action = maybe_demand(buffered_stream_duration, ctx, state)
@@ -213,9 +211,9 @@ defmodule Membrane.Realtimer do
 
   @spec initialize_new_substream(Time.t(), State.t()) :: State.t()
   defp initialize_new_substream(buffer_timestamp, %State{} = state) do
-    absolute_reference_timestamp =
-      if state.substreams == %{} do
-        Time.monotonic_time()
+    {absolute_reference_timestamp, new_substream_id} =
+      if state.currently_incoming_substream_id == nil do
+        {Time.monotonic_time(), 0}
       else
         previous_reference_timestamps =
           state.substreams[state.currently_incoming_substream_id].reference_timestamps
@@ -223,7 +221,8 @@ defmodule Membrane.Realtimer do
         previous_substream_total_duration =
           state.newest_timestamp - previous_reference_timestamps.stream
 
-        previous_reference_timestamps.absolute + previous_substream_total_duration
+        {previous_reference_timestamps.absolute + previous_substream_total_duration,
+         state.currently_incoming_substream_id + 1}
       end
 
     substream = %State.Substream{
@@ -236,9 +235,8 @@ defmodule Membrane.Realtimer do
     %State{
       state
       | initialize_new_substream: false,
-        currently_incoming_substream_id: state.currently_incoming_substream_id + 1,
-        substreams:
-          Map.put(state.substreams, state.currently_incoming_substream_id + 1, substream)
+        currently_incoming_substream_id: new_substream_id,
+        substreams: Map.put(state.substreams, new_substream_id, substream)
     }
   end
 
