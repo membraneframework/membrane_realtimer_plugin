@@ -65,7 +65,7 @@ defmodule Membrane.Realtimer do
             newest_timestamp: Time.non_neg(),
             currently_incoming_substream_id: non_neg_integer() | nil,
             start_of_stream_time: Time.t() | nil,
-            initialize_new_substream: boolean(),
+            initialize_new_substream?: boolean(),
             substreams: %{non_neg_integer() => Substream.t()}
           }
 
@@ -75,7 +75,7 @@ defmodule Membrane.Realtimer do
                 [
                   currently_incoming_substream_id: nil,
                   substreams: %{},
-                  initialize_new_substream: true,
+                  initialize_new_substream?: true,
                   offset: :calculating,
                   newest_timestamp: 0,
                   start_of_stream_time: nil
@@ -108,8 +108,8 @@ defmodule Membrane.Realtimer do
     buffer_timestamp = Buffer.get_dts_or_pts(buffer)
 
     state =
-      if state.initialize_new_substream do
-        initialize_new_substream(buffer_timestamp, state)
+      if state.initialize_new_substream? do
+        initialize_new_substream?(buffer_timestamp, state)
       else
         state
       end
@@ -127,15 +127,18 @@ defmodule Membrane.Realtimer do
     buffered_stream_duration = calculate_buffered_stream_duration(state)
 
     state =
-      if state.offset == :calculating do
-        if buffered_stream_duration >= state.max_latency do
-          lock_offset_and_schedule_all_queued_actions(state)
-        else
+      cond do
+        state.offset != :calculating ->
+          :ok =
+            schedule_action_batch(buffer_timestamp, state.currently_incoming_substream_id, state)
+
           state
-        end
-      else
-        schedule_action_batch(buffer_timestamp, state.currently_incoming_substream_id, state)
-        state
+
+        buffered_stream_duration >= state.max_latency ->
+          lock_offset_and_schedule_all_queued_actions(state)
+
+        true ->
+          state
       end
 
     demand_action = maybe_demand(buffered_stream_duration, ctx, state)
@@ -168,7 +171,7 @@ defmodule Membrane.Realtimer do
 
     state =
       if substream_id != state.currently_incoming_substream_id and
-           Enum.empty?(rest_of_action_batches) do
+           Qex.first(rest_of_action_batches) == :empty do
         update_in(state.substreams, &Map.delete(&1, substream_id))
       else
         put_in(state.substreams[substream_id].action_batches_queue, rest_of_action_batches)
@@ -179,7 +182,7 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_event(:input, %Events.Reset{}, _ctx, %State{} = state) do
-    {[], %State{state | initialize_new_substream: true}}
+    {[], %State{state | initialize_new_substream?: true}}
   end
 
   @impl true
@@ -189,12 +192,12 @@ defmodule Membrane.Realtimer do
 
   @impl true
   def handle_event(:input, event, _ctx, %State{} = state) do
-    maybe_queue_action({:event, {:output, event}}, state)
+    enqueue_or_emit_action({:event, {:output, event}}, state)
   end
 
   @impl true
   def handle_stream_format(:input, stream_format, _ctx, %State{} = state) do
-    maybe_queue_action({:stream_format, {:output, stream_format}}, state)
+    enqueue_or_emit_action({:stream_format, {:output, stream_format}}, state)
   end
 
   @impl true
@@ -206,11 +209,11 @@ defmodule Membrane.Realtimer do
         state
       end
 
-    maybe_queue_action({:end_of_stream, :output}, state)
+    enqueue_or_emit_action({:end_of_stream, :output}, state)
   end
 
-  @spec initialize_new_substream(Time.t(), State.t()) :: State.t()
-  defp initialize_new_substream(buffer_timestamp, %State{} = state) do
+  @spec initialize_new_substream?(Time.t(), State.t()) :: State.t()
+  defp initialize_new_substream?(buffer_timestamp, %State{} = state) do
     {absolute_reference_timestamp, new_substream_id} =
       if state.currently_incoming_substream_id == nil do
         {Time.monotonic_time(), 0}
@@ -234,7 +237,7 @@ defmodule Membrane.Realtimer do
 
     %State{
       state
-      | initialize_new_substream: false,
+      | initialize_new_substream?: false,
         currently_incoming_substream_id: new_substream_id,
         substreams: Map.put(state.substreams, new_substream_id, substream)
     }
@@ -264,7 +267,7 @@ defmodule Membrane.Realtimer do
     end
   end
 
-  @spec schedule_action_batch(Time.t(), non_neg_integer(), State.t()) :: reference() | nil
+  @spec schedule_action_batch(Time.t(), non_neg_integer(), State.t()) :: :ok
   defp schedule_action_batch(buffer_timestamp, substream_id, state) do
     substream = state.substreams[substream_id]
 
@@ -284,6 +287,8 @@ defmodule Membrane.Realtimer do
       {:send_scheduled_action_batch, substream_id},
       send_after_time
     )
+
+    :ok
   end
 
   @spec lock_offset_and_schedule_all_queued_actions(State.t()) :: State.t()
@@ -300,9 +305,9 @@ defmodule Membrane.Realtimer do
     state
   end
 
-  @spec maybe_queue_action(Membrane.Element.Action.t(), State.t()) ::
+  @spec enqueue_or_emit_action(Membrane.Element.Action.t(), State.t()) ::
           {[Membrane.Element.Action.t()], State.t()}
-  defp maybe_queue_action(action, state) do
+  defp enqueue_or_emit_action(action, state) do
     with current_substream when current_substream != nil <-
            Map.get(state.substreams, state.currently_incoming_substream_id),
          {{:value, latest_action_batch}, action_batches_queue} <-
